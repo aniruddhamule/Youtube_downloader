@@ -413,4 +413,4 @@ def api_stream(job_id):
 if __name__ == "__main__":
     os.makedirs(STORAGE_DIR, exist_ok=True)
     # Local dev port; on Koyeb you run with gunicorn binding to $PORT
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=8080, debug=True)
