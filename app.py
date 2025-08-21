@@ -1,5 +1,5 @@
 # app.py
-import os, time, json
+import os, time, json, urllib.parse
 from flask import Flask, request, jsonify, Response, render_template, make_response
 from yt_dlp.utils import DownloadError
 from downloader import (
@@ -7,7 +7,50 @@ from downloader import (
     probe_url_meta, STORAGE_DIR,
 )
 
+# NEW: CORS so a static site (GitHub Pages) can call your API
+try:
+    from flask_cors import CORS
+except Exception:
+    CORS = None
+
 app = Flask(__name__, template_folder="templates", static_folder=None)
+if CORS:
+    CORS(app)
+
+# ---- helper: make YouTube URL clean & consistent ----
+def canonicalize_youtube_url(url: str) -> str:
+    """
+    - Expands short youtu.be links to full watch URLs
+    - Strips useless 'si' param which sometimes breaks metadata probes
+    """
+    try:
+        u = url.strip()
+        if not u:
+            return u
+        parsed = urllib.parse.urlparse(u)
+
+        # short link like https://youtu.be/VIDEOID?si=...
+        if parsed.netloc in {"youtu.be", "www.youtu.be"} and parsed.path.strip("/"):
+            vid = parsed.path.strip("/")
+            q = urllib.parse.parse_qs(parsed.query or "")
+            # keep playlist id if present
+            list_id = q.get("list", [None])[0]
+            base = f"https://www.youtube.com/watch?v={vid}"
+            if list_id:
+                base += f"&list={list_id}"
+            return base
+
+        # normal youtube link: drop the 'si' param if present
+        if parsed.netloc.endswith("youtube.com"):
+            q = urllib.parse.parse_qs(parsed.query or "")
+            q.pop("si", None)
+            new_query = urllib.parse.urlencode({k: v[0] for k, v in q.items() if v})
+            return urllib.parse.urlunparse(parsed._replace(query=new_query))
+
+        return u
+    except Exception:
+        # if anything goes wrong, just return the original
+        return url
 
 # ---- Inline static JS so it never 404s ----
 APP_JS = r"""
@@ -294,24 +337,35 @@ def home():
     return render_template("index.html")
 
 # ------------------ API -----------------
-@app.post("/api/probe")
+
+# CHANGED: accept both GET and POST, be robust to missing JSON, and normalize URL
+@app.route("/api/probe", methods=["GET", "POST"])
 def api_probe():
-    data = request.get_json(force=True, silent=True) or {}
-    url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "Missing url"}), 400
     try:
+        data = request.get_json(silent=True) or {}
+        url = (request.args.get("url") or data.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "Missing url"}), 400
+
+        url = canonicalize_youtube_url(url)
         meta = probe_url_meta(url)
-        return jsonify(meta)
+
+        # Guard against None from helper
+        if not isinstance(meta, dict):
+            return jsonify({"error": "Probe failed: no metadata returned"}), 400
+
+        return jsonify(meta), 200
+
     except DownloadError:
         return jsonify({"error": "Probe failed: video/playlist unavailable or requires login (try cookies.txt)."}), 404
     except Exception as e:
+        # This is where the previous 'NoneType is not iterable' showed up.
         return jsonify({"error": f"Probe failed: {e}"}), 400
 
 @app.post("/api/jobs")
 def api_create_job():
     data = request.get_json(force=True, silent=True) or {}
-    url = data.get("url", "").strip()
+    url = (data.get("url") or "").strip()
     media_type = data.get("mediaType")
     video_height = data.get("videoHeight")
     audio_bitrate = data.get("audioBitrate")
@@ -321,6 +375,7 @@ def api_create_job():
     if not url or media_type not in ("video", "audio"):
         return jsonify({"error": "Invalid payload"}), 400
 
+    url = canonicalize_youtube_url(url)
     job_id = create_job(url, media_type, video_height, audio_bitrate, selected_urls, output_dir)
     return jsonify({"jobId": job_id})
 
@@ -357,4 +412,5 @@ def api_stream(job_id):
 
 if __name__ == "__main__":
     os.makedirs(STORAGE_DIR, exist_ok=True)
+    # Local dev port; on Koyeb you run with gunicorn binding to $PORT
     app.run(host="0.0.0.0", port=5000, debug=True)
